@@ -1,0 +1,3 @@
+telethon>=1.24.0
+asyncio>=3.4.3
+python-logging-handlers>=0.1.0
