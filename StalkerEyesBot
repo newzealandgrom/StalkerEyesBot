@@ -15,33 +15,55 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-API_ID = "ВАШ API_ID"
-API_HASH = "ВАШ API_HASH"
-BOT_TOKEN = "ВАШ BOT_TOKEN"
+API_ID = "*************"
+API_HASH = "***********"
+BOT_TOKEN = "***********"
 
 # Файл для хранения настроек
 SETTINGS_FILE = "monitor_settings.json"
 
+# Доступные реакции
+AVAILABLE_REACTIONS = {
+    "👀": "Глаза",
+    "👍": "Лайк", 
+    "❤️": "Сердце",
+    "🔥": "Огонь",
+    "🎉": "Праздник",
+    "😁": "Улыбка",
+    "😮": "Удивление",
+    "😢": "Грусть",
+    "🤔": "Думаю",
+    "👎": "Дизлайк"
+}
 
 class MessageMonitor:
     def __init__(self):
         self.client = None
         self.bot = None
-        self.monitored_groups = {}
+        self.monitored_groups = {}  # Теперь будет хранить словарь с настройками
         self.owner_id = None
         self.search_query = {}  # Для хранения поисковых запросов пользователей
         self.page_size = 5  # Количество групп на одной странице
         self.processed_messages = set()  # Для отслеживания обработанных сообщений
-        self.entity_cache = (
-            {}
-        )  # Кэш для entity, чтобы уменьшить количество API-запросов
+        self.entity_cache = {}  # Кэш для entity, чтобы уменьшить количество API-запросов
+        self.reaction_selection_state = {}  # Для отслеживания состояния выбора реакции
         self.load_settings()
 
     def load_settings(self):
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r") as f:
-                    self.monitored_groups = json.load(f)
+                    data = json.load(f)
+                    # Поддержка старого формата (просто список ID)
+                    if isinstance(data, dict) and all(isinstance(v, bool) for v in data.values()):
+                        # Конвертируем старый формат в новый
+                        self.monitored_groups = {
+                            group_id: {"enabled": True, "reaction": "👀"}
+                            for group_id in data
+                        }
+                        self.save_settings()  # Сохраняем в новом формате
+                    else:
+                        self.monitored_groups = data
                 logger.info(
                     f"Загружены настройки: отслеживается {len(self.monitored_groups)} групп"
                 )
@@ -52,10 +74,10 @@ class MessageMonitor:
     def save_settings(self):
         try:
             with open(SETTINGS_FILE, "w") as f:
-                json.dump(self.monitored_groups, f)
+                json.dump(self.monitored_groups, f, ensure_ascii=False, indent=2)
             # Создаем копию файла настроек для защиты от потери данных
             with open(f"{SETTINGS_FILE}.backup", "w") as f:
-                json.dump(self.monitored_groups, f)
+                json.dump(self.monitored_groups, f, ensure_ascii=False, indent=2)
             logger.info(
                 f"Настройки сохранены: отслеживается {len(self.monitored_groups)} групп"
             )
@@ -99,6 +121,15 @@ class MessageMonitor:
 
         return False, None
 
+    def get_group_reaction(self, group_id):
+        """Получает реакцию для группы"""
+        is_monitored, monitor_id = self.is_group_monitored(group_id)
+        if is_monitored and monitor_id:
+            group_settings = self.monitored_groups.get(monitor_id, {})
+            if isinstance(group_settings, dict):
+                return group_settings.get("reaction", "👀")
+        return "👀"  # Реакция по умолчанию
+
     async def get_entity_safely(self, chat_id, max_retries=3):
         """Безопасно получает entity с повторными попытками и кэшированием"""
         cache_key = str(chat_id)
@@ -116,10 +147,10 @@ class MessageMonitor:
         formats_to_try = [
             chat_id,  # Оригинальный формат
             int(chat_id)
-            if chat_id.lstrip("-").isdigit()
+            if isinstance(chat_id, str) and chat_id.lstrip("-").isdigit()
             else chat_id,  # Как число если возможно
             int(chat_id.replace("-100", "-"))
-            if chat_id.startswith("-100") and chat_id[4:].isdigit()
+            if isinstance(chat_id, str) and chat_id.startswith("-100") and chat_id[4:].isdigit()
             else chat_id,  # Короткий формат
         ]
 
@@ -170,14 +201,17 @@ class MessageMonitor:
             # Добавляем сообщение в список обработанных
             self.processed_messages.add(message_key)
 
+            # Получаем реакцию для группы
+            reaction = self.get_group_reaction(chat_id)
+
             # Ждем 2 минуты
             logger.info(
-                f"Запланирована реакция на сообщение в чате {chat_id}, id {message_id} через 2 минуты"
+                f"Запланирована реакция '{reaction}' на сообщение в чате {chat_id}, id {message_id} через 2 минуты"
             )
             await asyncio.sleep(120)
 
             logger.info(
-                f"Прошло 2 минуты, добавляем реакцию к сообщению {message_id} в чате {chat_id}"
+                f"Прошло 2 минуты, добавляем реакцию '{reaction}' к сообщению {message_id} в чате {chat_id}"
             )
 
             # Получаем entity заранее
@@ -185,7 +219,10 @@ class MessageMonitor:
             if not entity:
                 logger.error(f"❌ Не удалось найти чат {chat_id} для добавления реакции")
                 # Удаляем из мониторинга, если чат недоступен
-                if chat_id in self.monitored_groups:
+                if str(chat_id) in self.monitored_groups or any(
+                    fmt in self.monitored_groups 
+                    for fmt in [str(chat_id), str(chat_id).replace("-100", "-"), f"-100{str(chat_id)[1:]}" if str(chat_id).startswith("-") else f"-100{str(chat_id)}"]
+                ):
                     await self.stop_monitoring(chat_id)
                     logger.info(
                         f"Чат {chat_id} удален из мониторинга, так как недоступен"
@@ -202,86 +239,44 @@ class MessageMonitor:
                 self.processed_messages.remove(message_key)
                 return
 
-            # Добавляем реакцию, перебирая несколько методов
+            # Добавляем реакцию
             success = False
 
-            # Метод 1: Прямой вызов API с использованием полученного entity
+            # Метод 1: Стандартный API вызов
             try:
                 await self.client(
                     functions.messages.SendReactionRequest(
                         peer=entity,
                         msg_id=message_id,
-                        reaction=[types.ReactionEmoji(emoticon="👀")],
+                        reaction=[types.ReactionEmoji(emoticon=reaction)],
+                        big=False
                     )
                 )
                 logger.info(
-                    f"✅ Реакция успешно добавлена методом 1 к сообщению {message_id}"
+                    f"✅ Реакция '{reaction}' успешно добавлена к сообщению {message_id}"
                 )
                 success = True
             except Exception as e1:
-                logger.error(f"❌ Ошибка метода 1: {str(e1)}")
-
-                # Метод 2: Через react с сообщением
-                if not success:
-                    try:
-                        # Получаем сообщение снова для актуального состояния
-                        message = await self.client.get_messages(entity, ids=message_id)
-                        if message:
-                            await message.react("👀")
-                            logger.info(f"✅ Реакция успешно добавлена методом 2")
-                            success = True
-                        else:
-                            logger.warning(f"Сообщение {message_id} больше не доступно")
-                    except Exception as e2:
-                        logger.error(f"❌ Ошибка метода 2: {str(e2)}")
-
-                        # Метод 3: Попробуем через одиночную реакцию
-                        if not success:
-                            try:
-                                await self.client(
-                                    functions.messages.SendReactionRequest(
-                                        peer=entity,
-                                        msg_id=message_id,
-                                        reaction=types.ReactionEmoji(emoticon="👀"),
-                                    )
-                                )
-                                logger.info(f"✅ Реакция успешно добавлена методом 3")
-                                success = True
-                            except Exception as e3:
-                                logger.error(f"❌ Ошибка метода 3: {str(e3)}")
-
-                                # Метод 4: Попробуем через строку
-                                if not success:
-                                    try:
-                                        await self.client(
-                                            functions.messages.SendReactionRequest(
-                                                peer=entity,
-                                                msg_id=message_id,
-                                                reaction="👀",
-                                            )
-                                        )
-                                        logger.info(
-                                            f"✅ Реакция успешно добавлена методом 4"
-                                        )
-                                        success = True
-                                    except Exception as e4:
-                                        logger.error(f"❌ Ошибка метода 4: {str(e4)}")
+                logger.error(f"❌ Ошибка при добавлении реакции: {str(e1)}")
 
             if not success:
                 logger.error(
-                    f"❌ Не удалось добавить реакцию ни одним из методов к сообщению {message_id}"
+                    f"❌ Не удалось добавить реакцию к сообщению {message_id}"
                 )
-
-            # Очищаем запись об обработке, если не удалось
-            if not success:
+                # Удаляем из обработанных, чтобы можно было попробовать снова
                 self.processed_messages.remove(message_key)
 
             # Очищаем старые записи, если в списке более 1000 элементов
             if len(self.processed_messages) > 1000:
-                self.processed_messages = set(list(self.processed_messages)[-1000:])
+                # Преобразуем в список, сортируем и оставляем последние 1000
+                sorted_messages = sorted(list(self.processed_messages))
+                self.processed_messages = set(sorted_messages[-1000:])
 
         except Exception as e:
             logger.error(f"Общая ошибка в delayed_reaction: {str(e)}")
+            # Убираем сообщение из обработанных при ошибке
+            if message_key in self.processed_messages:
+                self.processed_messages.remove(message_key)
 
     async def validate_monitored_groups(self):
         """Проверяет доступность всех отслеживаемых групп"""
@@ -528,6 +523,16 @@ class MessageMonitor:
                 elif data.startswith("toggle_"):
                     # Включение/отключение мониторинга группы
                     await self.toggle_group_monitoring(event, data)
+                elif data.startswith("reaction_"):
+                    # Изменение реакции для группы
+                    group_id = data.split("_", 1)[1]
+                    await self.show_reaction_menu(event, group_id)
+                elif data.startswith("setreaction_"):
+                    # Установка выбранной реакции
+                    parts = data.split("_", 2)
+                    reaction = parts[1]
+                    group_id = parts[2]
+                    await self.set_group_reaction(event, group_id, reaction)
                 elif data == "search_groups":
                     # Кнопка поиска групп
                     await event.answer(
@@ -629,6 +634,58 @@ class MessageMonitor:
             except Exception as e:
                 logger.error(f"Ошибка при мониторинге сообщений: {str(e)}")
 
+    async def show_reaction_menu(self, event, group_id):
+        """Показывает меню выбора реакции для группы"""
+        buttons = []
+        
+        # Создаем кнопки для каждой доступной реакции
+        for reaction, name in AVAILABLE_REACTIONS.items():
+            current_reaction = self.get_group_reaction(group_id)
+            # Отмечаем текущую реакцию
+            prefix = "✅ " if reaction == current_reaction else ""
+            buttons.append([
+                Button.inline(f"{prefix}{reaction} {name}", f"setreaction_{reaction}_{group_id}")
+            ])
+        
+        buttons.append([Button.inline("🔙 Назад", f"toggle_{group_id}")])
+        
+        # Получаем информацию о группе
+        entity = await self.get_entity_safely(group_id)
+        group_name = entity.title if entity and hasattr(entity, "title") else f"Группа {group_id}"
+        
+        message = f"Выберите реакцию для группы '{group_name}':"
+        
+        try:
+            await event.edit(message, buttons=buttons)
+        except:
+            await event.respond(message, buttons=buttons)
+
+    async def set_group_reaction(self, event, group_id, reaction):
+        """Устанавливает реакцию для группы"""
+        is_monitored, monitor_id = self.is_group_monitored(group_id)
+        
+        if is_monitored and monitor_id:
+            # Обновляем настройки группы
+            if isinstance(self.monitored_groups[monitor_id], dict):
+                self.monitored_groups[monitor_id]["reaction"] = reaction
+            else:
+                # Конвертируем в новый формат если необходимо
+                self.monitored_groups[monitor_id] = {"enabled": True, "reaction": reaction}
+            
+            self.save_settings()
+            
+            # Получаем информацию о группе
+            entity = await self.get_entity_safely(group_id)
+            group_name = entity.title if entity and hasattr(entity, "title") else f"Группа {group_id}"
+            
+            await event.answer(f"✅ Реакция для группы '{group_name}' изменена на {reaction}")
+            
+            # Возвращаемся к списку групп
+            search = self.search_query.get(event.chat_id)
+            await self.show_groups_list(event, page=0, search=search, edit=True)
+        else:
+            await event.answer("❌ Группа не найдена в списке мониторинга", alert=True)
+
     async def send_main_menu(self, event):
         """Отправляет главное меню бота"""
         keyboard = [
@@ -679,10 +736,16 @@ class MessageMonitor:
             buttons = []
             for group in groups:
                 if hasattr(group, "id") and hasattr(group, "title"):
-                    is_monitored, _ = self.is_group_monitored(group.id)
+                    is_monitored, monitor_id = self.is_group_monitored(group.id)
                     status = "✅" if is_monitored else "⭕️"
-                    button_text = f"{status} {group.title}"
-                    buttons.append([Button.inline(button_text, f"toggle_{group.id}")])
+                    reaction = self.get_group_reaction(group.id) if is_monitored else ""
+                    button_text = f"{status} {group.title} {reaction}"
+                    buttons.append([
+                        Button.inline(button_text, f"toggle_{group.id}"),
+                        Button.inline("⚙️", f"reaction_{group.id}") if is_monitored else None
+                    ])
+                    # Убираем None из списка кнопок
+                    buttons[-1] = [btn for btn in buttons[-1] if btn is not None]
 
             # Добавляем навигационные кнопки
             nav_buttons = []
@@ -706,9 +769,9 @@ class MessageMonitor:
             buttons.append([Button.inline(search_info, "search_groups")])
             buttons.append([Button.inline("🔙 Главное меню", "main_menu")])
 
-            message = "Выберите группу для включения/отключения мониторинга:"
+            message = "Выберите группу для включения/отключения мониторинга:\n⚙️ - настройки реакции"
             if search:
-                message = f"Результаты поиска по запросу '{search}':"
+                message = f"Результаты поиска по запросу '{search}':\n⚙️ - настройки реакции"
 
             if edit and hasattr(event, "edit") and callable(event.edit):
                 try:
@@ -745,11 +808,13 @@ class MessageMonitor:
                     entity = await self.get_entity_safely(group_id)
 
                     if entity and hasattr(entity, "title"):
+                        reaction = self.get_group_reaction(group_id)
                         active_groups.append(
                             {
                                 "id": group_id,
                                 "title": entity.title,
                                 "status": "✅ Доступна",
+                                "reaction": reaction
                             }
                         )
                     else:
@@ -758,6 +823,7 @@ class MessageMonitor:
                                 "id": group_id,
                                 "title": f"Группа {group_id}",
                                 "status": "❌ Недоступна",
+                                "reaction": "—"
                             }
                         )
                 except Exception as e:
@@ -769,6 +835,7 @@ class MessageMonitor:
                             "id": group_id,
                             "title": f"Группа {group_id}",
                             "status": "❓ Ошибка доступа",
+                            "reaction": "—"
                         }
                     )
 
@@ -788,7 +855,9 @@ class MessageMonitor:
             # Добавляем группы в сообщение
             for idx, group in enumerate(current_groups, 1):
                 message += (
-                    f"{idx}. 📢 {group['title']} (ID: {group['id']}) {group['status']}\n"
+                    f"{idx}. 📢 {group['title']} (ID: {group['id']})\n"
+                    f"    Статус: {group['status']}\n"
+                    f"    Реакция: {group['reaction']}\n\n"
                 )
 
             # Создаем кнопки навигации
@@ -838,12 +907,25 @@ class MessageMonitor:
 1️⃣ Нажмите "📋 Список групп" чтобы увидеть все доступные группы
 2️⃣ Используйте "🔍 Поиск групп" для поиска по названию
 3️⃣ Нажмите на название группы, чтобы включить/отключить мониторинг
-4️⃣ Используйте "🔍 Активные мониторинги" для просмотра текущих мониторингов
-5️⃣ Используйте "🔄 Проверить доступность" для проверки доступа к группам
+4️⃣ Нажмите ⚙️ рядом с группой, чтобы выбрать реакцию
+5️⃣ Используйте "🔍 Активные мониторинги" для просмотра текущих мониторингов
+6️⃣ Используйте "🔄 Проверить доступность" для проверки доступа к группам
 
 ⚡️ Когда мониторинг включен:
 - Бот будет отмечать сообщения как прочитанные сразу при их получении
-- Через 2 минуты после сообщения будет добавлена реакция 👀
+- Через 2 минуты после сообщения будет добавлена выбранная реакция
+
+🎯 Доступные реакции:
+👀 Глаза (по умолчанию)
+👍 Лайк
+❤️ Сердце
+🔥 Огонь
+🎉 Праздник
+😁 Улыбка
+😮 Удивление
+😢 Грусть
+🤔 Думаю
+👎 Дизлайк
 
 💡 Если реакции перестали работать:
 - Проверьте доступность групп через меню
@@ -897,8 +979,11 @@ class MessageMonitor:
                     actual_group_id = str(entity.id)
                     normalized_id = self.normalize_group_id(actual_group_id)
 
-                    # Сохраняем группу в список мониторинга
-                    self.monitored_groups[normalized_id] = True
+                    # Сохраняем группу в список мониторинга с настройками по умолчанию
+                    self.monitored_groups[normalized_id] = {
+                        "enabled": True,
+                        "reaction": "👀"
+                    }
                     self.save_settings()
                     logger.info(
                         f"Включен мониторинг группы {normalized_id} (исходный ID: {actual_group_id})"
@@ -907,7 +992,8 @@ class MessageMonitor:
                     await event.respond(
                         f"✅ Мониторинг группы '{entity.title}' успешно включен!\n"
                         f"Теперь я буду автоматически отмечать сообщения как прочитанные и "
-                        f"ставить реакцию 👀 на новые сообщения в этой группе через 2 минуты."
+                        f"ставить реакцию 👀 на новые сообщения в этой группе через 2 минуты.\n"
+                        f"Вы можете изменить реакцию, нажав ⚙️ рядом с группой."
                     )
                     logger.info(
                         f"Подтверждено добавление группы {normalized_id} в мониторинг"
@@ -930,10 +1016,13 @@ class MessageMonitor:
 
     async def stop_monitoring(self, group_id):
         """Останавливает мониторинг группы"""
-        if str(group_id) in self.monitored_groups:
-            del self.monitored_groups[str(group_id)]
+        # Проверяем разные форматы ID
+        is_monitored, monitor_id = self.is_group_monitored(group_id)
+        
+        if is_monitored and monitor_id in self.monitored_groups:
+            del self.monitored_groups[monitor_id]
             self.save_settings()
-            logger.info(f"Остановлен мониторинг группы {group_id}")
+            logger.info(f"Остановлен мониторинг группы {monitor_id}")
             return True
         return False
 
@@ -982,7 +1071,9 @@ class MessageMonitor:
                     logger.info(
                         f"Очистка списка обработанных сообщений, текущий размер: {len(self.processed_messages)}"
                     )
-                    self.processed_messages = set(list(self.processed_messages)[-1000:])
+                    # Преобразуем в список, сортируем и оставляем последние 1000
+                    sorted_messages = sorted(list(self.processed_messages))
+                    self.processed_messages = set(sorted_messages[-1000:])
                     logger.info(f"Размер после очистки: {len(self.processed_messages)}")
             except Exception as e:
                 logger.error(f"Ошибка при очистке списка обработанных сообщений: {e}")
